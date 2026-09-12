@@ -1,0 +1,161 @@
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include "DHT.h"
+#include <WiFi.h>
+
+// --- HARDWARE PINS ---
+#define DHTPIN 4
+#define DHTTYPE DHT22
+#define VIB_PIN 16
+#define LED_PIN 17
+#define BUZZER_PIN 18
+
+// --- OPTIONAL WI-FI CONFIG ---
+const char* ssid = "Nunu";
+const char* password = "janani@21";
+
+// --- SENSOR & DISPLAY OBJECTS ---
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+DHT dht(DHTPIN, DHTTYPE);
+
+// --- PRODUCT PROFILE: Pasteurized Milk Example ---
+const float OPTIMAL_TEMP = 4.0;          // Ideal storage temp (°C)
+const float BASE_SHELF_LIFE_DAYS = 10.0; // Base shelf life (Days)
+const float Q10 = 2.5;                   // Thermal sensitivity
+
+// --- SYSTEM STATE VARIABLES ---
+float remainingRSL = BASE_SHELF_LIFE_DAYS; 
+unsigned long lastTickTime = 0;
+unsigned long lastVibTime = 0;
+bool isTransitMode = false;
+
+void setup() {
+  Serial.begin(115200);
+  
+  // Pin Initialization (Internal pull-down ensures clean LOW when quiet)
+  pinMode(VIB_PIN, INPUT_PULLDOWN); 
+  pinMode(LED_PIN, OUTPUT);
+  pinMode(BUZZER_PIN, OUTPUT);
+  
+  // Sensor & LCD Initialization
+  Wire.begin(21, 22);
+  lcd.init();
+  lcd.backlight();
+  dht.begin();
+
+  // Non-blocking Wi-Fi Connection Attempt
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(ssid, password);
+
+  // Welcome Screen
+  lcd.setCursor(0, 0);
+  lcd.print("ColdChain Smart");
+  lcd.setCursor(0, 1);
+  lcd.print("RSL Predictor ");
+  delay(2000);
+  lcd.clear();
+  
+  lastTickTime = millis();
+}
+
+void loop() {
+  unsigned long currentMillis = millis();
+
+  // 1. FIXED VIBRATION DETECTION
+  // Check both HIGH or state transition to catch motion reliably
+  int vibState = digitalRead(VIB_PIN);
+  
+  // Note: If your sensor lights up LED on tap, it outputs HIGH on motion.
+  // If it goes LOW on tap, change 'HIGH' to 'LOW' in the line below:
+  if (vibState == HIGH) { 
+    lastVibTime = currentMillis; 
+  }
+
+  // Active TRANSIT mode lasts for 3 seconds after physical vibration stops
+  if (currentMillis - lastVibTime < 3000) {
+    isTransitMode = true;
+  } else {
+    isTransitMode = false;
+  }
+
+  // 2. RSL CALCULATION & DEMO TICK (Runs every 1 second)
+  if (currentMillis - lastTickTime >= 1000) {
+    lastTickTime = currentMillis;
+
+    float temp = dht.readTemperature();
+    float hum = dht.readHumidity();
+
+    if (isnan(temp) || isnan(hum)) {
+      temp = OPTIMAL_TEMP; 
+      hum = 50.0;
+    }
+
+    // Vibration Multiplier: 1.5x in transit, 1.0x in storage
+    float vibrationMultiplier = isTransitMode ? 1.50 : 1.00;
+
+    // Q10 Thermal Decay Math
+    float tempDiff = temp - OPTIMAL_TEMP;
+    if (tempDiff < 0) tempDiff = 0;
+    
+    float decayFactor = pow(Q10, tempDiff / 10.0) * vibrationMultiplier;
+
+    // --- ACCELERATED DEMO DECAY ---
+    // Subtracts ~0.25 Days per second in ambient temp so you can see RSL drop quickly!
+    // (For real deployment, replace '0.25' with '(1.0 * decayFactor) / 86400.0')
+    float rslLoss = (0.25 * decayFactor); 
+    remainingRSL -= rslLoss;
+    
+    // Auto-reset for continuous demo loop once spoiled
+    if (remainingRSL <= 0) {
+      remainingRSL = BASE_SHELF_LIFE_DAYS; 
+    }
+
+    // --- ALERT & INDICATOR LOGIC ---
+    float percentRSL = (remainingRSL / BASE_SHELF_LIFE_DAYS) * 100.0;
+
+    if (percentRSL < 20.0) { 
+      // CRITICAL / SPOILED: Solid Red LED & Beeping Buzzer
+      digitalWrite(LED_PIN, HIGH);
+      digitalWrite(BUZZER_PIN, (currentMillis / 250) % 2); 
+    } 
+    else if (percentRSL < 50.0) { 
+      // WARNING: Blinking LED & Silent Buzzer
+      digitalWrite(LED_PIN, (currentMillis / 500) % 2); 
+      digitalWrite(BUZZER_PIN, LOW);
+    } 
+    else { 
+      // OPTIMAL: All Alarms Off
+      digitalWrite(LED_PIN, LOW);
+      digitalWrite(BUZZER_PIN, LOW);
+    }
+
+    // --- LCD DISPLAY OUTPUT ---
+    lcd.setCursor(0, 0);
+    lcd.print("T:");
+    lcd.print(temp, 1);
+    lcd.print("C H:");
+    lcd.print((int)hum);
+    lcd.print("% ");
+    lcd.print(isTransitMode ? "TR" : "ST");
+
+    lcd.setCursor(0, 1);
+    lcd.print("RSL:");
+    lcd.print(remainingRSL, 1);
+    lcd.print("d ");
+
+    if (percentRSL < 20.0) {
+      lcd.print("SPOILED!");
+    } else if (percentRSL < 50.0) {
+      lcd.print("WARN!   ");
+    } else {
+      lcd.print("OK      ");
+    }
+
+    // --- SERIAL MONITOR OUTPUT ---
+    Serial.print("Temp: "); Serial.print(temp, 1);
+    Serial.print("C | Mode: "); Serial.print(isTransitMode ? "TRANSIT" : "STORAGE");
+    Serial.print(" | Decay Factor: "); Serial.print(decayFactor, 2);
+    Serial.print("x | RSL: "); Serial.print(remainingRSL, 2);
+    Serial.print("d ("); Serial.print(percentRSL, 1); Serial.println("%)");
+  }
+}
